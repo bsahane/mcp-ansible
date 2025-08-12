@@ -2,6 +2,27 @@ MCP Ansible Server
 
 Advanced Ansible Model Context Protocol (MCP) server in Python exposing Ansible utilities for inventories, playbooks, roles, and project workflows.
 
+Quick start
+
+```bash
+git clone https://github.com/bsahane/mcp-ansible.git
+cd mcp-ansible
+
+# Create and activate Python virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install dependencies
+python -m pip install -U pip
+pip install "mcp[cli]>=1.2.0" "PyYAML>=6.0.1" "ansible-core>=2.16.0"
+
+# (Optional) install the project package locally
+pip install -e .
+
+# Run the MCP server
+python src/ansible_mcp/server.py
+```
+
 Requirements
 
 - Python 3.10+
