@@ -9,6 +9,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 
 import yaml
 from mcp.server.fastmcp import FastMCP
@@ -486,6 +487,245 @@ def project_bootstrap(project_root: str) -> dict[str, Any]:
     # galaxy install
     galaxy = galaxy_install(str(root))
     return {"ok": rc_v == 0 and rc_c == 0 and galaxy.get("ok", False), "details": details, "galaxy": galaxy}
+
+
+# -------------------------
+# Phase 2: Diff, Idempotence, Vault, Galaxy lock
+# -------------------------
+
+
+def _parse_play_recap(stdout: str) -> dict[str, dict[str, int]]:
+    totals: dict[str, dict[str, int]] = {}
+    started = False
+    for line in stdout.splitlines():
+        if line.strip().startswith("PLAY RECAP"):
+            started = True
+            continue
+        if started:
+            if not line.strip():
+                continue
+            parts = line.split(":", 1)
+            if len(parts) != 2:
+                continue
+            host = parts[0].strip()
+            stats = {k: 0 for k in ["ok", "changed", "unreachable", "failed", "skipped", "rescued", "ignored"]}
+            for seg in parts[1].split():
+                if "=" in seg:
+                    k, v = seg.split("=", 1)
+                    if k in stats:
+                        try:
+                            stats[k] = int(v)
+                        except ValueError:
+                            pass
+            totals[host] = stats
+    return totals
+
+
+def _sum_changed(totals: dict[str, dict[str, int]]) -> int:
+    return sum(v.get("changed", 0) for v in totals.values())
+
+
+@mcp.tool(name="inventory-diff")
+def inventory_diff(left_project_root: str | None = None, left_ansible_cfg_path: str | None = None, left_inventory_paths: list[str] | None = None, right_project_root: str | None = None, right_ansible_cfg_path: str | None = None, right_inventory_paths: list[str] | None = None, include_hostvars: bool | None = None) -> dict[str, Any]:
+    """Diff two inventories: hosts, groups, and optionally hostvars keys.
+
+    Returns:
+      - added_hosts, removed_hosts
+      - added_groups, removed_groups, group_membership_changes
+      - hostvars_key_changes (if include_hostvars)
+    """
+    left = inventory_parse(project_root=left_project_root, ansible_cfg_path=left_ansible_cfg_path, inventory_paths=left_inventory_paths, include_hostvars=include_hostvars)
+    if not left.get("ok"):
+        return {"ok": False, "side": "left", "error": left}
+    right = inventory_parse(project_root=right_project_root, ansible_cfg_path=right_ansible_cfg_path, inventory_paths=right_inventory_paths, include_hostvars=include_hostvars)
+    if not right.get("ok"):
+        return {"ok": False, "side": "right", "error": right}
+    left_hosts = set(left.get("hosts", []))
+    right_hosts = set(right.get("hosts", []))
+    added_hosts = sorted(list(right_hosts - left_hosts))
+    removed_hosts = sorted(list(left_hosts - right_hosts))
+    left_groups = {k: set(v) for k, v in (left.get("groups", {}) or {}).items()}
+    right_groups = {k: set(v) for k, v in (right.get("groups", {}) or {}).items()}
+    added_groups = sorted(list(set(right_groups.keys()) - set(left_groups.keys())))
+    removed_groups = sorted(list(set(left_groups.keys()) - set(right_groups.keys())))
+    group_membership_changes: dict[str, dict[str, list[str]]] = {}
+    for g in sorted(set(left_groups.keys()) & set(right_groups.keys())):
+        l = left_groups[g]
+        r = right_groups[g]
+        add = sorted(list(r - l))
+        rem = sorted(list(l - r))
+        if add or rem:
+            group_membership_changes[g] = {"added": add, "removed": rem}
+    res: dict[str, Any] = {
+        "ok": True,
+        "added_hosts": added_hosts,
+        "removed_hosts": removed_hosts,
+        "added_groups": added_groups,
+        "removed_groups": removed_groups,
+        "group_membership_changes": group_membership_changes,
+    }
+    if include_hostvars:
+        lv = {h: set(((left.get("hostvars", {}) or {}).get(h) or {}).keys()) for h in left_hosts}
+        rv = {h: set(((right.get("hostvars", {}) or {}).get(h) or {}).keys()) for h in right_hosts}
+        hv_changes: dict[str, dict[str, list[str]]] = {}
+        for h in sorted(left_hosts | right_hosts):
+            lks = lv.get(h, set())
+            rks = rv.get(h, set())
+            add = sorted(list(rks - lks))
+            rem = sorted(list(lks - rks))
+            if add or rem:
+                hv_changes[h] = {"added": add, "removed": rem}
+        res["hostvars_key_changes"] = hv_changes
+    return res
+
+
+@mcp.tool(name="ansible-test-idempotence")
+def ansible_test_idempotence(playbook_path: str, project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None, extra_vars: dict[str, Any] | None = None, verbose: int | None = None) -> dict[str, Any]:
+    """Run a playbook twice and ensure no changes on the second run. Returns recap and pass/fail."""
+    env, cwd = _compose_ansible_env(ansible_cfg_path, project_root, None)
+    inventory_str = ",".join(inventory_paths) if inventory_paths else None
+    # First apply
+    first = ansible_playbook(playbook_path=playbook_path, inventory=inventory_str, extra_vars=extra_vars, cwd=str(cwd) if cwd else None, verbose=verbose, env=env)
+    first_recap = _parse_play_recap(first.get("stdout", ""))
+    # Second apply
+    second = ansible_playbook(playbook_path=playbook_path, inventory=inventory_str, extra_vars=extra_vars, cwd=str(cwd) if cwd else None, verbose=verbose, env=env)
+    second_recap = _parse_play_recap(second.get("stdout", ""))
+    changed_total = _sum_changed(second_recap)
+    return {
+        "ok": first.get("ok", False) and second.get("ok", False) and changed_total == 0,
+        "first_rc": first.get("rc"),
+        "second_rc": second.get("rc"),
+        "first_recap": first_recap,
+        "second_recap": second_recap,
+        "changed_total_second": changed_total,
+        "first_command": first.get("command"),
+        "second_command": second.get("command"),
+    }
+
+
+@mcp.tool(name="galaxy-lock")
+def galaxy_lock(project_root: str, output_path: str | None = None) -> dict[str, Any]:
+    """Create a simple lock file for installed roles/collections under the project root."""
+    root = Path(project_root).expanduser().resolve()
+    env, cwd = _compose_ansible_env(None, str(root), None)
+    # Collections list
+    rc_c, out_c, err_c = _run_command(["ansible-galaxy", "collection", "list", "--format", "json"], cwd=cwd, env=env)
+    collections: list[dict[str, str]] = []
+    if rc_c == 0:
+        try:
+            data = json.loads(out_c)
+            for name, info in data.items():
+                version = str(info.get("version")) if isinstance(info, dict) else None
+                if version:
+                    collections.append({"name": name, "version": version})
+        except Exception:
+            pass
+    # Roles list (best-effort parse)
+    rc_r, out_r, err_r = _run_command(["ansible-galaxy", "role", "list"], cwd=cwd, env=env)
+    roles: list[dict[str, str]] = []
+    if rc_r == 0:
+        for line in out_r.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            # Expect forms like: namespace.role, x.y.z
+            if "," in s:
+                left, right = s.split(",", 1)
+                name = left.strip()
+                version = right.strip().lstrip("v ")
+                if name:
+                    roles.append({"name": name, "version": version})
+            else:
+                parts = s.split()
+                if len(parts) >= 2:
+                    roles.append({"name": parts[0], "version": parts[1].lstrip("v ")})
+    lock = {"collections": sorted(collections, key=lambda x: x["name"]), "roles": sorted(roles, key=lambda x: x["name"]) }
+    text = yaml.safe_dump(lock, sort_keys=False)
+    path = Path(output_path).expanduser().resolve() if output_path else (root / "requirements.lock.yml")
+    path.write_text(text, encoding="utf-8")
+    return {"ok": True, "path": str(path), "collections": len(collections), "roles": len(roles)}
+
+
+@contextmanager
+def _vault_password_file(password: str):
+    tf = tempfile.NamedTemporaryFile(prefix="vault_", suffix=".pwd", delete=False)
+    try:
+        tf.write(password.encode("utf-8"))
+        tf.flush()
+        tf.close()
+        yield tf.name
+    finally:
+        try:
+            os.remove(tf.name)
+        except Exception:
+            pass
+
+
+def _resolve_vault_pw_args(password: str | None, password_file: str | None) -> tuple[list[str], str | None]:
+    if password_file:
+        return (["--vault-password-file", password_file], None)
+    if password:
+        return (["--vault-password-file", "__TEMPFILE__"], password)
+    env_pw = os.environ.get("MCP_VAULT_PASSWORD")
+    if env_pw:
+        return (["--vault-password-file", "__TEMPFILE__"], env_pw)
+    env_pw_file = os.environ.get("VAULT_PASSWORD_FILE")
+    if env_pw_file:
+        return (["--vault-password-file", env_pw_file], None)
+    return ([], None)
+
+
+def _run_vault_cmd(subcmd: list[str], project_root: str | None, password: str | None, password_file: str | None) -> dict[str, Any]:
+    env, cwd = _compose_ansible_env(None, project_root, None)
+    args, inline_pw = _resolve_vault_pw_args(password, password_file)
+    if inline_pw is None:
+        rc, out, err = _run_command(["ansible-vault", *subcmd, *args], cwd=cwd, env=env)
+        return {"ok": rc == 0, "rc": rc, "stdout": out, "stderr": err, "command": shlex.join(["ansible-vault", *subcmd, *args])}
+    else:
+        with _vault_password_file(inline_pw) as pwfile:
+            vault_args = [a if a != "__TEMPFILE__" else pwfile for a in args]
+            rc, out, err = _run_command(["ansible-vault", *subcmd, *vault_args], cwd=cwd, env=env)
+            return {"ok": rc == 0, "rc": rc, "stdout": out, "stderr": err, "command": shlex.join(["ansible-vault", *subcmd, *vault_args])}
+
+
+@mcp.tool(name="vault-encrypt")
+def vault_encrypt(file_paths: list[str] | str, project_root: str | None = None, password: str | None = None, password_file: str | None = None) -> dict[str, Any]:
+    files = [file_paths] if isinstance(file_paths, str) else list(file_paths)
+    return _run_vault_cmd(["encrypt", *files], project_root, password, password_file)
+
+
+@mcp.tool(name="vault-decrypt")
+def vault_decrypt(file_paths: list[str] | str, project_root: str | None = None, password: str | None = None, password_file: str | None = None) -> dict[str, Any]:
+    files = [file_paths] if isinstance(file_paths, str) else list(file_paths)
+    return _run_vault_cmd(["decrypt", *files], project_root, password, password_file)
+
+
+@mcp.tool(name="vault-view")
+def vault_view(file_path: str, project_root: str | None = None, password: str | None = None, password_file: str | None = None) -> dict[str, Any]:
+    return _run_vault_cmd(["view", file_path], project_root, password, password_file)
+
+
+@mcp.tool(name="vault-rekey")
+def vault_rekey(file_paths: list[str] | str, project_root: str | None = None, old_password: str | None = None, old_password_file: str | None = None, new_password: str | None = None, new_password_file: str | None = None) -> dict[str, Any]:
+    files = [file_paths] if isinstance(file_paths, str) else list(file_paths)
+    # First provide old password
+    old_args, inline_old = _resolve_vault_pw_args(old_password, old_password_file)
+    # New password via env: ANSIBLE_VAULT_NEW_PASSWORD_FILE not supported CLI; use --new-vault-password-file
+    new_args, inline_new = _resolve_vault_pw_args(new_password, new_password_file)
+    # Combine
+    subcmd = ["rekey", *files, *(["--new-vault-password-file", "__TEMPFILE_NEW__"] if (inline_new or new_password_file) else []), *old_args]
+    env, cwd = _compose_ansible_env(None, project_root, None)
+    if inline_old or inline_new:
+        with _vault_password_file(inline_old or "") as oldf, _vault_password_file(inline_new or "") as newf:
+            cmd = ["ansible-vault", *([c if c != "__TEMPFILE_NEW__" else newf for c in subcmd])]
+            # Replace placeholder in old_args
+            cmd = [a if a != "__TEMPFILE__" else oldf for a in cmd]
+            rc, out, err = _run_command(cmd, cwd=cwd, env=env)
+            return {"ok": rc == 0, "rc": rc, "stdout": out, "stderr": err, "command": shlex.join(cmd)}
+    # No inline passwords, just use provided files
+    cmd = ["ansible-vault", *([c if c != "__TEMPFILE_NEW__" else (new_args[1] if new_args else "") for c in subcmd])]
+    rc, out, err = _run_command(cmd, cwd=cwd, env=env)
+    return {"ok": rc == 0, "rc": rc, "stdout": out, "stderr": err, "command": shlex.join(cmd)}
 
 
 @mcp.tool(name="register-project")
