@@ -1,0 +1,4 @@
+mcp[cli]==1.12.4
+ansible-core==2.19.0
+PyYAML==6.0.2
+

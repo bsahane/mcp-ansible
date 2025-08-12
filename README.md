@@ -12,9 +12,9 @@ cd mcp-ansible
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Install dependencies
+# Install dependencies via requirements.txt
 python -m pip install -U pip
-pip install "mcp[cli]>=1.2.0" "PyYAML>=6.0.1" "ansible-core>=2.16.0"
+pip install -r requirements.txt
 
 # (Optional) install the project package locally
 pip install -e .
