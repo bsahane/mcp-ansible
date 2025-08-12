@@ -166,3 +166,188 @@ Reference
 
 - MCP Quickstart (Python): https://modelcontextprotocol.io/quickstart/server#python
 
+
+### Tool reference (detailed)
+
+Below are all tools with short descriptions, minimal args, an example question you can ask in the MCP UI, and a sample answer.
+
+- **create-playbook**: Create an Ansible playbook file from YAML string or object
+  - Minimal args:
+    ```json
+    { "playbook": [{"hosts":"all","tasks":[{"debug":{"msg":"hi"}}]}] }
+    ```
+  - Example question: "Create a playbook that prints hello for all hosts."
+  - Possible answer: `{ "path": "/tmp/playbook_x.yml", "bytes_written": 123, "preview": "- hosts: all..." }`
+
+- **validate-playbook**: Syntax check a playbook
+  - Minimal args:
+    ```json
+    { "playbook_path": "/abs/playbook.yml" }
+    ```
+  - Example question: "Is this playbook syntactically valid?"
+  - Possible answer: `{ "ok": true, "rc": 0 }`
+
+- **ansible-playbook**: Run a playbook
+  - Minimal args:
+    ```json
+    { "playbook_path": "/abs/playbook.yml", "inventory": "localhost," }
+    ```
+  - Example question: "Run this playbook against localhost."
+  - Possible answer: `{ "ok": true, "rc": 0, "stdout": "PLAY [all]..." }`
+
+- **ansible-task**: Run an ad‑hoc module
+  - Minimal args:
+    ```json
+    { "host_pattern": "localhost", "module": "ping", "inventory": "localhost," }
+    ```
+  - Example question: "Ping localhost."
+  - Possible answer: `{ "ok": true, "stdout": "pong" }`
+
+- **ansible-role**: Execute a role via a temporary playbook
+  - Minimal args:
+    ```json
+    { "role_name": "myrole", "hosts": "localhost", "inventory": "localhost," }
+    ```
+  - Example question: "Run role myrole on localhost."
+  - Possible answer: `{ "ok": true, "rc": 0 }`
+
+- **create-role-structure**: Scaffold a role directory tree
+  - Minimal args:
+    ```json
+    { "base_path": "/tmp", "role_name": "demo" }
+    ```
+  - Example question: "Create an Ansible role skeleton named demo."
+  - Possible answer: `{ "created": [".../tasks/main.yml", ...], "role_path": "/tmp/demo" }`
+
+- **ansible-inventory**: List hosts and groups from an inventory
+  - Minimal args:
+    ```json
+    { "inventory": "/abs/inventory" }
+    ```
+  - Example question: "List hosts in this inventory."
+  - Possible answer: `{ "hosts": ["host01"], "groups": {"web": ["host01"]} }`
+
+- **register-project**: Register an Ansible project for reuse
+  - Minimal args:
+    ```json
+    { "name": "proj", "root": "/abs/project", "make_default": true }
+    ```
+  - Example question: "Register my project root and make it default."
+  - Possible answer: `{ "path": "~/.config/mcp-ansible/config.json", "projects": ["proj"] }`
+
+- **list-projects**: Show registered projects
+  - Minimal args: `{}`
+  - Example question: "What projects are registered and which is default?"
+  - Possible answer: `{ "default": "proj", "projects": {"proj": {"root": "/abs"}} }`
+
+- **project-playbooks**: Discover playbooks under a project root
+  - Minimal args:
+    ```json
+    { "project": "proj" }
+    ```
+  - Example question: "List playbooks in my project."
+  - Possible answer: `{ "ok": true, "playbooks": ["/abs/x.yml", "/abs/y.yml"] }`
+
+- **project-run-playbook**: Run a playbook using project inventory/env
+  - Minimal args:
+    ```json
+    { "playbook_path": "/abs/x.yml", "project": "proj" }
+    ```
+  - Example question: "Run x.yml in my default project."
+  - Possible answer: `{ "ok": true, "rc": 0 }`
+
+- **inventory-parse**: Parse inventories (ansible.cfg aware, merges group_vars/host_vars)
+  - Minimal args:
+    ```json
+    { "project_root": "/abs/project", "include_hostvars": true }
+    ```
+  - Example question: "Resolve all hosts and vars from my project root."
+  - Possible answer: `{ "hosts": ["h1"], "groups": {"web":["h1"]}, "hostvars": {"h1": {...}} }`
+
+- **inventory-graph**: Show inventory graph
+  - Minimal args:
+    ```json
+    { "project_root": "/abs/project" }
+    ```
+  - Example question: "Show the inventory graph."
+  - Possible answer: "@all\n |--@web\n |  |--h1"
+
+- **inventory-find-host**: Show a host’s groups and merged vars
+  - Minimal args:
+    ```json
+    { "project_root": "/abs/project", "host": "h1" }
+    ```
+  - Example question: "What groups and vars does h1 have?"
+  - Possible answer: `{ "groups": ["web"], "hostvars": {"ansible_user":"root"} }`
+
+- **ansible-ping**: Ping hosts via ad-hoc
+  - Minimal args:
+    ```json
+    { "project_root": "/abs/project", "host_pattern": "localhost" }
+    ```
+  - Example question: "Ping localhost."
+  - Possible answer: `{ "ok": true, "rc": 0 }`
+
+- **ansible-gather-facts**: Run setup and return facts
+  - Minimal args:
+    ```json
+    { "project_root": "/abs/project", "host_pattern": "localhost" }
+    ```
+  - Example question: "Gather facts from localhost."
+  - Possible answer: `{ "facts": {"localhost": {"ansible_hostname":"node"}} }`
+
+- **validate-yaml**: Validate YAML files
+  - Minimal args:
+    ```json
+    { "paths": ["/abs/file.yml"] }
+    ```
+  - Example question: "Validate this YAML file."
+  - Possible answer: `{ "ok": true, "results": [{"path":"/abs/file.yml","ok":true}] }`
+
+- **galaxy-install**: Install roles/collections from requirements
+  - Minimal args:
+    ```json
+    { "project_root": "/abs/project" }
+    ```
+  - Example question: "Install galaxy dependencies for my project."
+  - Possible answer: `{ "ok": true, "executed": [{"kind":"collection","rc":0}] }`
+
+- **project-bootstrap**: Bootstrap project (env info + galaxy install)
+  - Minimal args:
+    ```json
+    { "project_root": "/abs/project" }
+    ```
+  - Example question: "Bootstrap my project."
+  - Possible answer: `{ "ok": true, "details": {"ansible_version":"..."} }`
+
+- **inventory-diff**: Diff two inventories
+  - Minimal args:
+    ```json
+    { "left_project_root": "/abs/project", "right_project_root": "/abs/project" }
+    ```
+  - Example question: "What changed between stage and prod inventories?"
+  - Possible answer: `{ "added_hosts": [], "removed_hosts": [], "group_membership_changes": {} }`
+
+- **ansible-test-idempotence**: Run playbook twice and assert no changes second run
+  - Minimal args:
+    ```json
+    { "playbook_path": "/abs/playbook.yml", "project_root": "/abs/project" }
+    ```
+  - Example question: "Is this playbook idempotent?"
+  - Possible answer: `{ "ok": true, "changed_total_second": 0 }`
+
+- **galaxy-lock**: Generate a lock file of installed roles/collections
+  - Minimal args:
+    ```json
+    { "project_root": "/abs/project" }
+    ```
+  - Example question: "Create a requirements.lock.yml for my project."
+  - Possible answer: `{ "ok": true, "path": "/abs/requirements.lock.yml" }`
+
+- **vault-encrypt / vault-decrypt / vault-view / vault-rekey**: Vault operations
+  - Minimal args (encrypt):
+    ```json
+    { "file_paths": ["/abs/group_vars/all/vault.yml"], "project_root": "/abs/project" }
+    ```
+  - Example question: "Encrypt group_vars/all/vault.yml with my vault password."
+  - Possible answer: `{ "ok": true, "rc": 0 }`
