@@ -259,6 +259,235 @@ def ansible_inventory(inventory: str | None = None, include_hostvars: bool | Non
     return result
 
 
+# -------------------------
+# Local Inventory Suite
+# -------------------------
+
+def _compose_ansible_env(ansible_cfg_path: str | None = None, project_root: str | None = None, extra_env: dict[str, str] | None = None) -> tuple[dict[str, str], Path | None]:
+    env: dict[str, str] = {}
+    if ansible_cfg_path:
+        env["ANSIBLE_CONFIG"] = str(Path(ansible_cfg_path).expanduser().resolve())
+    cwd: Path | None = Path(project_root).expanduser().resolve() if project_root else None
+    if extra_env:
+        env.update(extra_env)
+    return env, cwd
+
+
+def _inventory_cli(inventory_paths: list[str] | None) -> list[str]:
+    if not inventory_paths:
+        return []
+    joined = ",".join(str(Path(p).expanduser().resolve()) for p in inventory_paths)
+    return ["-i", joined]
+
+
+@mcp.tool(name="inventory-parse")
+def inventory_parse(project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None, include_hostvars: bool | None = None, deep: bool | None = None) -> dict[str, Any]:
+    """Parse inventory via ansible-inventory, merging group_vars/host_vars.
+
+    Args:
+        project_root: Project root folder (sets CWD and uses ansible.cfg if present)
+        ansible_cfg_path: Explicit ansible.cfg path (overrides)
+        inventory_paths: Optional list of inventory files/dirs (ini/yaml/no-ext supported)
+        include_hostvars: Include merged hostvars in response
+        deep: Placeholder for future source mapping; ignored for now
+    """
+    extra_env = {"INVENTORY_ENABLED": "auto"}
+    env, cwd = _compose_ansible_env(ansible_cfg_path, project_root, extra_env)
+    cmd: list[str] = ["ansible-inventory", "--list"] + _inventory_cli(inventory_paths)
+    rc, out, err = _run_command(cmd, cwd=cwd, env=env)
+    result: dict[str, Any] = {"ok": rc == 0, "rc": rc, "stderr": err, "command": shlex.join(cmd), "cwd": str(cwd) if cwd else None}
+    if rc != 0:
+        result["stdout"] = out
+        return result
+    try:
+        data = json.loads(out)
+    except Exception:
+        result["stdout"] = out
+        return result
+    hosts, groups = _extract_hosts_from_inventory_json(data)
+    result["hosts"] = sorted(hosts)
+    result["groups"] = {k: sorted(v) for k, v in groups.items()}
+    if include_hostvars:
+        meta = data.get("_meta") or {}
+        hostvars = meta.get("hostvars") or {}
+        result["hostvars"] = hostvars
+    return result
+
+
+@mcp.tool(name="inventory-graph")
+def inventory_graph(project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None) -> dict[str, Any]:
+    """Return ansible-inventory --graph output using discovered config."""
+    env, cwd = _compose_ansible_env(ansible_cfg_path, project_root, None)
+    cmd: list[str] = ["ansible-inventory", "--graph"] + _inventory_cli(inventory_paths)
+    rc, out, err = _run_command(cmd, cwd=cwd, env=env)
+    return {"ok": rc == 0, "rc": rc, "graph": out, "stderr": err, "command": shlex.join(cmd), "cwd": str(cwd) if cwd else None}
+
+
+@mcp.tool(name="inventory-find-host")
+def inventory_find_host(host: str, project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None) -> dict[str, Any]:
+    """Find a host, its groups, and merged variables across the resolved inventories."""
+    parsed = inventory_parse(project_root=project_root, ansible_cfg_path=ansible_cfg_path, inventory_paths=inventory_paths, include_hostvars=True)
+    if not parsed.get("ok"):
+        return parsed
+    all_groups: dict[str, list[str]] = parsed.get("groups", {})
+    hostvars: dict[str, Any] = parsed.get("hostvars", {})
+    groups_for_host = sorted([g for g, members in all_groups.items() if host in set(members)])
+    return {
+        "ok": True,
+        "host": host,
+        "present": host in hostvars or any(host in members for members in all_groups.values()),
+        "groups": groups_for_host,
+        "hostvars": hostvars.get(host, {}),
+    }
+
+
+@mcp.tool(name="ansible-ping")
+def ansible_ping(host_pattern: str, project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None, verbose: int | None = None) -> dict[str, Any]:
+    """Ping hosts using the Ansible ad-hoc ping module."""
+    env, cwd = _compose_ansible_env(ansible_cfg_path, project_root, None)
+    inventory_str = ",".join(inventory_paths) if inventory_paths else None
+    return ansible_task(
+        host_pattern=host_pattern,
+        module="ping",
+        args=None,
+        inventory=inventory_str,
+        cwd=str(cwd) if cwd else None,
+        verbose=verbose,
+        env=env,
+    )
+
+
+def _parse_setup_stdout(stdout: str) -> dict[str, Any]:
+    facts: dict[str, Any] = {}
+    for line in stdout.splitlines():
+        if "SUCCESS" in line and "=>" in line:
+            try:
+                left, right = line.split("=>", 1)
+                host = left.split("|")[0].strip()
+                data = json.loads(right.strip())
+                facts[host] = data.get("ansible_facts") or data
+            except Exception:
+                continue
+    return facts
+
+
+@mcp.tool(name="ansible-gather-facts")
+def ansible_gather_facts(host_pattern: str, project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None, filter: str | None = None, gather_subset: str | None = None, verbose: int | None = None) -> dict[str, Any]:
+    """Gather facts using the setup module and return parsed per-host facts."""
+    env, cwd = _compose_ansible_env(ansible_cfg_path, project_root, {"ANSIBLE_STDOUT_CALLBACK": "default"})
+    args: dict[str, Any] = {}
+    if filter:
+        args["filter"] = filter
+    if gather_subset:
+        args["gather_subset"] = gather_subset
+    inventory_str = ",".join(inventory_paths) if inventory_paths else None
+    res = ansible_task(
+        host_pattern=host_pattern,
+        module="setup",
+        args=args or None,
+        inventory=inventory_str,
+        cwd=str(cwd) if cwd else None,
+        verbose=verbose,
+        env=env,
+    )
+    facts = _parse_setup_stdout(res.get("stdout", ""))
+    res["facts"] = facts
+    return res
+
+
+@mcp.tool(name="validate-yaml")
+def validate_yaml(paths: list[str] | str) -> dict[str, Any]:
+    """Validate YAML files; return parse errors with line/column if any."""
+    path_list = [paths] if isinstance(paths, str) else list(paths)
+    results: list[dict[str, Any]] = []
+    ok_all = True
+    for p in path_list:
+        entry: dict[str, Any] = {"path": str(p)}
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                yaml.safe_load(f)
+            entry["ok"] = True
+        except yaml.YAMLError as e:  # type: ignore[attr-defined]
+            ok_all = False
+            info: dict[str, Any] = {"message": str(e)}
+            if hasattr(e, "problem_mark") and e.problem_mark is not None:  # type: ignore[attr-defined]
+                mark = e.problem_mark
+                info.update({"line": getattr(mark, "line", None), "column": getattr(mark, "column", None)})
+            entry["ok"] = False
+            entry["error"] = info
+        except Exception as e:
+            ok_all = False
+            entry["ok"] = False
+            entry["error"] = {"message": str(e)}
+        results.append(entry)
+    return {"ok": ok_all, "results": results}
+
+
+def _exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except Exception:
+        return False
+
+
+@mcp.tool(name="galaxy-install")
+def galaxy_install(project_root: str, force: bool | None = None, requirements_paths: list[str] | None = None) -> dict[str, Any]:
+    """Install roles and collections from requirements files under the project root."""
+    root = Path(project_root).expanduser().resolve()
+    env, cwd = _compose_ansible_env(None, str(root), None)
+    reqs: list[tuple[str, str, list[str]]] = []
+    # Roles
+    roles_requirements = [root / "roles" / "requirements.yml", root / "requirements.yml"]
+    for rp in roles_requirements:
+        if _exists(rp):
+            cmd = ["ansible-galaxy", "role", "install", "-r", str(rp), "-p", "roles"]
+            if force:
+                cmd.append("--force")
+            reqs.append(("role", str(rp), cmd))
+    # Collections
+    coll_requirements = [root / "collections" / "requirements.yml", root / "requirements.yml"]
+    for cp in coll_requirements:
+        if _exists(cp):
+            cmd = ["ansible-galaxy", "collection", "install", "-r", str(cp), "-p", "collections"]
+            if force:
+                cmd.append("--force")
+            reqs.append(("collection", str(cp), cmd))
+    # User-specified additional requirement files
+    for p in (requirements_paths or []):
+        pp = Path(p)
+        if _exists(pp):
+            # Try both role and collection installs (best-effort)
+            reqs.append(("role", str(pp), ["ansible-galaxy", "role", "install", "-r", str(pp), "-p", "roles"]))
+            reqs.append(("collection", str(pp), ["ansible-galaxy", "collection", "install", "-r", str(pp), "-p", "collections"]))
+    executed: list[dict[str, Any]] = []
+    if not reqs:
+        return {"ok": True, "executed": [], "note": "No requirements.yml found"}
+    ok_all = True
+    for kind, path, cmd in reqs:
+        rc, out, err = _run_command(cmd, cwd=cwd, env=env)
+        executed.append({"kind": kind, "requirements": path, "rc": rc, "stdout": out, "stderr": err, "command": shlex.join(cmd)})
+        if rc != 0:
+            ok_all = False
+    return {"ok": ok_all, "executed": executed}
+
+
+@mcp.tool(name="project-bootstrap")
+def project_bootstrap(project_root: str) -> dict[str, Any]:
+    """Bootstrap a project: install galaxy deps and report Ansible environment details."""
+    root = Path(project_root).expanduser().resolve()
+    details: dict[str, Any] = {"project_root": str(root)}
+    env, cwd = _compose_ansible_env(None, str(root), None)
+    # ansible --version
+    rc_v, out_v, err_v = _run_command(["ansible", "--version"], cwd=cwd, env=env)
+    details["ansible_version"] = out_v.strip()
+    # ansible-config dump (short)
+    rc_c, out_c, err_c = _run_command(["ansible-config", "dump"], cwd=cwd, env=env)
+    details["ansible_config_dump"] = out_c
+    # galaxy install
+    galaxy = galaxy_install(str(root))
+    return {"ok": rc_v == 0 and rc_c == 0 and galaxy.get("ok", False), "details": details, "galaxy": galaxy}
+
+
 @mcp.tool(name="register-project")
 def register_project(name: str, root: str, inventory: str | None = None, roles_paths: list[str] | None = None, collections_paths: list[str] | None = None, env: dict[str, str] | None = None, make_default: bool | None = None) -> dict[str, Any]:
     """Register an existing Ansible project with this MCP server.

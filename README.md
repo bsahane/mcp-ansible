@@ -80,6 +80,17 @@ Tools (names)
 - project-playbooks: Discover playbooks under a project root
 - project-run-playbook: Run a playbook using a registered project’s inventory/env
 
+Local inventory suite (no AAP/AWX)
+
+- inventory-parse: Parse inventories (ansible.cfg-aware), return hosts/groups/hostvars
+- inventory-graph: Show group/host graph
+- inventory-find-host: Show a host’s groups and merged vars
+- ansible-ping: Ad-hoc ping module
+- ansible-gather-facts: Run setup and return parsed facts
+- validate-yaml: Validate YAML files with error locations
+- galaxy-install: Install roles/collections from requirements
+- project-bootstrap: Galaxy install + env inspection
+
 Environment variables (optional)
 
 - MCP_ANSIBLE_PROJECT_ROOT: absolute project root
@@ -124,6 +135,27 @@ Examples (Claude Tools)
     - project: "projectAIOPS"
   - Tool: project-run-playbook
     - playbook_path: absolute path from discovered list
+
+Examples for local inventory suite
+
+- Parse via ansible.cfg with multiple inventories (merges group_vars/host_vars):
+  - Tool: inventory-parse
+  - Args:
+    - ansible_cfg_path: "/abs/path/to/ansible.cfg"
+    - include_hostvars: true
+
+- Parse a specific extensionless inventory file:
+  - Tool: inventory-parse
+  - Args:
+    - project_root: "/abs/path/to/project"
+    - inventory_paths: ["/abs/path/to/project/inventories/stage/inventory"]
+    - include_hostvars: true
+
+- Ping a group from inventory:
+  - Tool: ansible-ping
+  - Args:
+    - project_root: "/abs/path/to/project"
+    - host_pattern: "aws_mx_ext_stage"
 
 Notes
 
