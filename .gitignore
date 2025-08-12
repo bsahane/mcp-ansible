@@ -10,4 +10,5 @@ build/
 *.cache
 *.tmp
 tmp/
+.cursor/
 
