@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+dist/
+build/
+.pytest_cache/
+*.log
+*.retry
+*.cache
+*.tmp
+tmp/
+
