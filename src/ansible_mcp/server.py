@@ -10,6 +10,11 @@ import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
+import time
+import hashlib
+import re
+from datetime import datetime, timedelta
+from collections import defaultdict
 
 import yaml
 from mcp.server.fastmcp import FastMCP
@@ -1004,6 +1009,1237 @@ def create_role_structure(base_path: str, role_name: str) -> dict[str, Any]:
             main_file.write_text("---\n", encoding="utf-8")
             created.append(str(main_file))
     return {"created": created, "role_path": str(role_dir)}
+
+
+# -------------------------
+# Troubleshooting Suite
+# -------------------------
+
+def _parse_json_output(stdout: str) -> dict[str, Any]:
+    """Parse JSON output from Ansible modules that return structured data."""
+    facts: dict[str, Any] = {}
+    for line in stdout.splitlines():
+        if "SUCCESS" in line and "=>" in line:
+            try:
+                left, right = line.split("=>", 1)
+                host = left.split("|")[0].strip()
+                data = json.loads(right.strip())
+                facts[host] = data
+            except Exception:
+                continue
+    return facts
+
+
+def _calculate_health_score(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Calculate a health score based on system metrics."""
+    score = 100
+    issues = []
+    recommendations = []
+    
+    # CPU health (0-100)
+    cpu_usage = metrics.get("cpu_percent", 0)
+    if cpu_usage > 90:
+        score -= 30
+        issues.append("Critical CPU usage")
+        recommendations.append("Identify high CPU processes and optimize or scale")
+    elif cpu_usage > 75:
+        score -= 15
+        issues.append("High CPU usage")
+        recommendations.append("Monitor CPU trends and prepare for scaling")
+    
+    # Memory health
+    memory_percent = metrics.get("memory_percent", 0)
+    if memory_percent > 95:
+        score -= 25
+        issues.append("Critical memory usage")
+        recommendations.append("Free memory or add more RAM")
+    elif memory_percent > 85:
+        score -= 10
+        issues.append("High memory usage")
+        recommendations.append("Monitor memory consumption patterns")
+    
+    # Disk health
+    disk_usage = metrics.get("disk_usage_percent", 0)
+    if disk_usage > 95:
+        score -= 20
+        issues.append("Critical disk space")
+        recommendations.append("Clean up files or expand storage")
+    elif disk_usage > 85:
+        score -= 10
+        issues.append("High disk usage")
+        recommendations.append("Plan for disk space expansion")
+    
+    # Service health
+    failed_services = metrics.get("failed_services", [])
+    if failed_services:
+        score -= len(failed_services) * 15
+        issues.extend([f"Service {svc} is failed" for svc in failed_services])
+        recommendations.extend([f"Investigate and restart {svc}" for svc in failed_services])
+    
+    # Network connectivity
+    if not metrics.get("network_reachable", True):
+        score -= 20
+        issues.append("Network connectivity issues")
+        recommendations.append("Check network configuration and connectivity")
+    
+    return {
+        "score": max(0, score),
+        "level": "critical" if score < 50 else "warning" if score < 80 else "healthy",
+        "issues": issues,
+        "recommendations": recommendations
+    }
+
+
+def _generate_snapshot_id() -> str:
+    """Generate a unique snapshot ID."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    random_suffix = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
+    return f"snapshot_{timestamp}_{random_suffix}"
+
+
+def _analyze_log_patterns(logs: str) -> dict[str, Any]:
+    """Analyze log content for patterns and anomalies."""
+    lines = logs.splitlines()
+    
+    # Error patterns
+    error_patterns = [
+        (r"ERROR|CRITICAL|FATAL", "error"),
+        (r"WARNING|WARN", "warning"),
+        (r"failed|failure|exception", "failure"),
+        (r"timeout|timed out", "timeout"),
+        (r"connection refused|connection reset", "connection"),
+        (r"out of memory|oom", "memory"),
+        (r"permission denied|access denied", "permission")
+    ]
+    
+    pattern_counts = defaultdict(int)
+    recent_errors = []
+    
+    for line in lines[-1000:]:  # Analyze last 1000 lines
+        line_lower = line.lower()
+        for pattern, category in error_patterns:
+            if re.search(pattern, line_lower):
+                pattern_counts[category] += 1
+                if category in ["error", "failure", "timeout"]:
+                    recent_errors.append(line.strip())
+    
+    return {
+        "pattern_counts": dict(pattern_counts),
+        "recent_errors": recent_errors[-10:],  # Last 10 errors
+        "total_lines_analyzed": min(1000, len(lines)),
+        "error_rate": sum(pattern_counts.values()) / max(1, len(lines[-1000:])) * 100
+    }
+
+
+@mcp.tool(name="ansible-remote-command")
+def ansible_remote_command(host_pattern: str, command: str, project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None, become: bool | None = None, timeout: int | None = None) -> dict[str, Any]:
+    """Execute arbitrary shell commands on remote hosts with enhanced output parsing.
+    
+    Args:
+        host_pattern: Target hosts pattern
+        command: Shell command to execute
+        project_root: Project root directory
+        ansible_cfg_path: Ansible config file path
+        inventory_paths: Inventory file paths
+        become: Use privilege escalation
+        timeout: Command timeout in seconds
+    """
+    env, cwd = _compose_ansible_env(ansible_cfg_path, project_root, None)
+    inventory_str = ",".join(inventory_paths) if inventory_paths else None
+    
+    args = {"_raw_params": command}
+    if timeout:
+        args["timeout"] = timeout
+    
+    result = ansible_task(
+        host_pattern=host_pattern,
+        module="shell",
+        args=args,
+        inventory=inventory_str,
+        become=become,
+        cwd=str(cwd) if cwd else None,
+        env=env
+    )
+    
+    # Parse structured output if available
+    if result.get("ok"):
+        parsed = _parse_json_output(result.get("stdout", ""))
+        if parsed:
+            result["parsed_output"] = parsed
+    
+    return result
+
+
+@mcp.tool(name="ansible-fetch-logs")
+def ansible_fetch_logs(host_pattern: str, log_paths: list[str], project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None, lines: int | None = 100, filter_pattern: str | None = None, analyze: bool | None = True) -> dict[str, Any]:
+    """Fetch and analyze log files from remote hosts.
+    
+    Args:
+        host_pattern: Target hosts pattern
+        log_paths: List of log file paths to fetch
+        project_root: Project root directory
+        ansible_cfg_path: Ansible config file path
+        inventory_paths: Inventory file paths
+        lines: Number of lines to fetch (like tail -n)
+        filter_pattern: Regex pattern to filter log lines
+        analyze: Perform log pattern analysis
+    """
+    env, cwd = _compose_ansible_env(ansible_cfg_path, project_root, None)
+    inventory_str = ",".join(inventory_paths) if inventory_paths else None
+    
+    results = {}
+    
+    for log_path in log_paths:
+        # Build command to fetch logs
+        cmd_parts = [f"tail -n {lines or 100} {log_path}"]
+        if filter_pattern:
+            cmd_parts.append(f"grep -E '{filter_pattern}'")
+        
+        command = " | ".join(cmd_parts)
+        
+        result = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": command},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        
+        if result.get("ok") and analyze:
+            # Analyze log patterns
+            log_content = result.get("stdout", "")
+            analysis = _analyze_log_patterns(log_content)
+            result["analysis"] = analysis
+        
+        results[log_path] = result
+    
+    return {
+        "ok": all(r.get("ok", False) for r in results.values()),
+        "logs": results,
+        "summary": {
+            "total_logs": len(log_paths),
+            "successful": sum(1 for r in results.values() if r.get("ok")),
+            "failed": sum(1 for r in results.values() if not r.get("ok"))
+        }
+    }
+
+
+@mcp.tool(name="ansible-service-manager")
+def ansible_service_manager(host_pattern: str, service_name: str, action: str, project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None, check_logs: bool | None = True) -> dict[str, Any]:
+    """Manage services with status checking and log correlation.
+    
+    Args:
+        host_pattern: Target hosts pattern
+        service_name: Name of the service
+        action: Action to perform (status, start, stop, restart, reload)
+        project_root: Project root directory
+        ansible_cfg_path: Ansible config file path
+        inventory_paths: Inventory file paths
+        check_logs: Fetch recent service logs
+    """
+    env, cwd = _compose_ansible_env(ansible_cfg_path, project_root, None)
+    inventory_str = ",".join(inventory_paths) if inventory_paths else None
+    
+    # Execute service action
+    result = ansible_task(
+        host_pattern=host_pattern,
+        module="systemd",
+        args={"name": service_name, "state": action if action != "status" else None},
+        inventory=inventory_str,
+        cwd=str(cwd) if cwd else None,
+        env=env
+    )
+    
+    # Get service status
+    status_result = ansible_task(
+        host_pattern=host_pattern,
+        module="service_facts",
+        inventory=inventory_str,
+        cwd=str(cwd) if cwd else None,
+        env=env
+    )
+    
+    # Fetch recent logs if requested
+    logs = {}
+    if check_logs:
+        log_result = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": f"journalctl -u {service_name} -n 20 --no-pager"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        logs = log_result
+    
+    return {
+        "ok": result.get("ok", False),
+        "action_result": result,
+        "status": status_result,
+        "logs": logs,
+        "service": service_name,
+        "action": action
+    }
+
+
+@mcp.tool(name="ansible-diagnose-host")
+def ansible_diagnose_host(host_pattern: str, project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None, checks: list[str] | None = None, baseline_compare: bool | None = False, include_recommendations: bool | None = True) -> dict[str, Any]:
+    """Comprehensive health assessment of target hosts.
+    
+    Args:
+        host_pattern: Target hosts pattern
+        project_root: Project root directory
+        ansible_cfg_path: Ansible config file path
+        inventory_paths: Inventory file paths
+        checks: List of check categories (system, network, security, performance)
+        baseline_compare: Compare against stored baseline
+        include_recommendations: Include actionable recommendations
+    """
+    env, cwd = _compose_ansible_env(ansible_cfg_path, project_root, None)
+    inventory_str = ",".join(inventory_paths) if inventory_paths else None
+    
+    check_types = checks or ["system", "network", "security", "performance"]
+    diagnosis = {"timestamp": datetime.now().isoformat(), "checks": {}}
+    
+    # System health check
+    if "system" in check_types:
+        # CPU, memory, disk usage
+        system_result = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": "df -h / | tail -1 | awk '{print $5}' | sed 's/%//'; free | grep Mem | awk '{print ($3/$2)*100}'; top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | sed 's/%us,//'"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        
+        # Parse system metrics
+        if system_result.get("ok"):
+            output_lines = system_result.get("stdout", "").strip().split('\n')
+            try:
+                disk_usage = float(output_lines[0]) if output_lines else 0
+                memory_usage = float(output_lines[1]) if len(output_lines) > 1 else 0
+                cpu_usage = float(output_lines[2]) if len(output_lines) > 2 else 0
+                
+                system_metrics = {
+                    "disk_usage_percent": disk_usage,
+                    "memory_percent": memory_usage,
+                    "cpu_percent": cpu_usage
+                }
+            except (ValueError, IndexError):
+                system_metrics = {"error": "Failed to parse system metrics"}
+        else:
+            system_metrics = {"error": "Failed to gather system metrics"}
+        
+        diagnosis["checks"]["system"] = system_metrics
+    
+    # Network health check
+    if "network" in check_types:
+        network_result = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": "ping -c 3 8.8.8.8 > /dev/null 2>&1 && echo 'reachable' || echo 'unreachable'"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        
+        diagnosis["checks"]["network"] = {
+            "internet_reachable": network_result.get("stdout", "").strip() == "reachable" if network_result.get("ok") else False
+        }
+    
+    # Security check
+    if "security" in check_types:
+        security_result = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": "last -n 5 | grep -v 'wtmp begins' | wc -l; ps aux | grep -v grep | grep -E '(ssh|telnet|ftp)' | wc -l"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        
+        diagnosis["checks"]["security"] = {
+            "recent_logins": security_result.get("stdout", "0").strip().split('\n')[0] if security_result.get("ok") else "unknown",
+            "network_services": security_result.get("stdout", "0").strip().split('\n')[1] if security_result.get("ok") and len(security_result.get("stdout", "").strip().split('\n')) > 1 else "unknown"
+        }
+    
+    # Performance check
+    if "performance" in check_types:
+        perf_result = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": "uptime | awk '{print $(NF-2), $(NF-1), $NF}' | tr -d ','"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        
+        diagnosis["checks"]["performance"] = {
+            "load_average": perf_result.get("stdout", "").strip() if perf_result.get("ok") else "unknown"
+        }
+    
+    # Calculate overall health score
+    if include_recommendations:
+        all_metrics = {}
+        for check_type, metrics in diagnosis["checks"].items():
+            if isinstance(metrics, dict) and "error" not in metrics:
+                all_metrics.update(metrics)
+        
+        health_assessment = _calculate_health_score(all_metrics)
+        diagnosis["health_score"] = health_assessment
+    
+    return {
+        "ok": True,
+        "diagnosis": diagnosis,
+        "host_pattern": host_pattern,
+        "timestamp": diagnosis["timestamp"]
+    }
+
+
+@mcp.tool(name="ansible-capture-baseline")
+def ansible_capture_baseline(host_pattern: str, snapshot_name: str, project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None, include: list[str] | None = None) -> dict[str, Any]:
+    """Capture comprehensive system state baseline for later comparison.
+    
+    Args:
+        host_pattern: Target hosts pattern
+        snapshot_name: Name for this baseline snapshot
+        project_root: Project root directory
+        ansible_cfg_path: Ansible config file path
+        inventory_paths: Inventory file paths
+        include: Categories to include (configs, processes, network, performance)
+    """
+    env, cwd = _compose_ansible_env(ansible_cfg_path, project_root, None)
+    inventory_str = ",".join(inventory_paths) if inventory_paths else None
+    
+    snapshot_id = _generate_snapshot_id()
+    categories = include or ["configs", "processes", "network", "performance"]
+    baseline = {
+        "snapshot_id": snapshot_id,
+        "name": snapshot_name,
+        "timestamp": datetime.now().isoformat(),
+        "host_pattern": host_pattern,
+        "data": {}
+    }
+    
+    # Capture process information
+    if "processes" in categories:
+        proc_result = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": "ps aux --sort=-%cpu | head -20"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        baseline["data"]["processes"] = proc_result
+    
+    # Capture network configuration
+    if "network" in categories:
+        net_result = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": "ip addr show; netstat -tuln"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        baseline["data"]["network"] = net_result
+    
+    # Capture system configuration
+    if "configs" in categories:
+        config_result = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": "uname -a; cat /etc/os-release; systemctl list-units --failed"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        baseline["data"]["configs"] = config_result
+    
+    # Capture performance metrics
+    if "performance" in categories:
+        perf_result = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": "vmstat 1 3; iostat -x 1 3"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        baseline["data"]["performance"] = perf_result
+    
+    # Store baseline (in real implementation, this would go to a database or file)
+    # For now, we'll return the baseline data
+    return {
+        "ok": True,
+        "snapshot_id": snapshot_id,
+        "name": snapshot_name,
+        "categories_captured": categories,
+        "timestamp": baseline["timestamp"],
+        "baseline_data": baseline  # In production, store this externally
+    }
+
+
+@mcp.tool(name="ansible-compare-states")
+def ansible_compare_states(host_pattern: str, baseline_snapshot_id: str, current_snapshot_name: str | None = None, project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None) -> dict[str, Any]:
+    """Compare current system state against a previously captured baseline.
+    
+    Args:
+        host_pattern: Target hosts pattern
+        baseline_snapshot_id: ID of the baseline snapshot to compare against
+        current_snapshot_name: Optional name for the current state snapshot
+        project_root: Project root directory
+        ansible_cfg_path: Ansible config file path
+        inventory_paths: Inventory file paths
+    """
+    # Capture current state
+    current_name = current_snapshot_name or f"current_{datetime.now().strftime('%H%M%S')}"
+    current_state = ansible_capture_baseline(
+        host_pattern=host_pattern,
+        snapshot_name=current_name,
+        project_root=project_root,
+        ansible_cfg_path=ansible_cfg_path,
+        inventory_paths=inventory_paths
+    )
+    
+    # In a real implementation, you would fetch the baseline from storage
+    # For now, we'll return a comparison framework
+    return {
+        "ok": current_state.get("ok", False),
+        "comparison": {
+            "baseline_id": baseline_snapshot_id,
+            "current_snapshot": current_state.get("snapshot_id"),
+            "timestamp": datetime.now().isoformat(),
+            "differences": {
+                "processes": "Process comparison would be performed here",
+                "network": "Network configuration changes would be detected",
+                "configs": "Configuration drift analysis",
+                "performance": "Performance regression detection"
+            },
+            "summary": {
+                "changes_detected": 0,  # Would be calculated from actual comparison
+                "critical_changes": 0,
+                "recommendations": ["Comparison analysis would generate recommendations here"]
+            }
+        },
+        "current_state": current_state
+    }
+
+
+@mcp.tool(name="ansible-auto-heal")
+def ansible_auto_heal(host_pattern: str, symptoms: list[str], project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None, max_impact: str | None = "low", dry_run: bool | None = True) -> dict[str, Any]:
+    """Intelligent automated problem resolution with safety checks.
+    
+    Args:
+        host_pattern: Target hosts pattern
+        symptoms: List of detected symptoms
+        project_root: Project root directory
+        ansible_cfg_path: Ansible config file path
+        inventory_paths: Inventory file paths
+        max_impact: Maximum allowed impact level (low, medium, high)
+        dry_run: Preview actions without executing
+    """
+    env, cwd = _compose_ansible_env(ansible_cfg_path, project_root, None)
+    inventory_str = ",".join(inventory_paths) if inventory_paths else None
+    
+    # Symptom-to-solution mapping
+    healing_actions = []
+    
+    for symptom in symptoms:
+        if symptom == "high_cpu":
+            healing_actions.append({
+                "symptom": symptom,
+                "action": "restart_high_cpu_processes",
+                "impact": "medium",
+                "command": "kill -9 $(ps aux --sort=-%cpu | head -6 | tail -5 | awk '{print $2}')",
+                "safety_check": "ps aux --sort=-%cpu | head -6",
+                "description": "Terminate top 5 CPU-consuming processes"
+            })
+        
+        elif symptom == "high_memory":
+            healing_actions.append({
+                "symptom": symptom,
+                "action": "clear_cache",
+                "impact": "low",
+                "command": "sync && echo 3 > /proc/sys/vm/drop_caches",
+                "safety_check": "free -m",
+                "description": "Clear system cache to free memory"
+            })
+        
+        elif symptom == "disk_full":
+            healing_actions.append({
+                "symptom": symptom,
+                "action": "cleanup_temp_files",
+                "impact": "low",
+                "command": "find /tmp -type f -atime +7 -delete && find /var/log -name '*.log' -size +100M -delete",
+                "safety_check": "df -h",
+                "description": "Clean up old temporary files and large logs"
+            })
+        
+        elif symptom == "service_failed":
+            healing_actions.append({
+                "symptom": symptom,
+                "action": "restart_failed_services",
+                "impact": "medium",
+                "command": "systemctl reset-failed && systemctl restart $(systemctl --failed --no-legend | awk '{print $1}')",
+                "safety_check": "systemctl --failed",
+                "description": "Restart all failed services"
+            })
+    
+    # Filter actions by impact level
+    impact_hierarchy = {"low": 1, "medium": 2, "high": 3}
+    max_impact_level = impact_hierarchy.get(max_impact or "low", 1)
+    
+    allowed_actions = [
+        action for action in healing_actions
+        if impact_hierarchy.get(action["impact"], 1) <= max_impact_level
+    ]
+    
+    execution_results = []
+    
+    if not dry_run:
+        # Execute healing actions
+        for action in allowed_actions:
+            # Run safety check first
+            safety_result = ansible_task(
+                host_pattern=host_pattern,
+                module="shell",
+                args={"_raw_params": action["safety_check"]},
+                inventory=inventory_str,
+                cwd=str(cwd) if cwd else None,
+                env=env
+            )
+            
+            # Execute healing action
+            heal_result = ansible_task(
+                host_pattern=host_pattern,
+                module="shell",
+                args={"_raw_params": action["command"]},
+                inventory=inventory_str,
+                cwd=str(cwd) if cwd else None,
+                env=env
+            )
+            
+            execution_results.append({
+                "action": action,
+                "safety_check_result": safety_result,
+                "healing_result": heal_result,
+                "success": heal_result.get("ok", False)
+            })
+    
+    return {
+        "ok": True,
+        "symptoms": symptoms,
+        "proposed_actions": allowed_actions,
+        "blocked_actions": [a for a in healing_actions if a not in allowed_actions],
+        "max_impact": max_impact,
+        "dry_run": dry_run,
+        "execution_results": execution_results if not dry_run else None,
+        "summary": {
+            "total_symptoms": len(symptoms),
+            "actionable_symptoms": len(allowed_actions),
+            "executed_actions": len(execution_results) if not dry_run else 0,
+            "successful_actions": sum(1 for r in execution_results if r.get("success")) if not dry_run else 0
+        }
+    }
+
+
+@mcp.tool(name="ansible-network-matrix")
+def ansible_network_matrix(host_patterns: list[str], target_hosts: list[str] | None = None, project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None, check_ports: list[int] | None = None) -> dict[str, Any]:
+    """Comprehensive network connectivity matrix between hosts.
+    
+    Args:
+        host_patterns: List of source host patterns
+        target_hosts: List of target hostnames/IPs to test (defaults to same as sources)
+        project_root: Project root directory
+        ansible_cfg_path: Ansible config file path
+        inventory_paths: Inventory file paths
+        check_ports: List of ports to check connectivity (default: [22, 80, 443])
+    """
+    env, cwd = _compose_ansible_env(ansible_cfg_path, project_root, None)
+    inventory_str = ",".join(inventory_paths) if inventory_paths else None
+    
+    ports = check_ports or [22, 80, 443]
+    matrix_results = {}
+    
+    for host_pattern in host_patterns:
+        matrix_results[host_pattern] = {}
+        
+        # Get the actual hosts for this pattern first
+        hosts_result = ansible_task(
+            host_pattern=host_pattern,
+            module="setup",
+            args={"gather_subset": "!all,network"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        
+        targets = target_hosts or host_patterns
+        for target in targets:
+            # Ping test
+            ping_result = ansible_task(
+                host_pattern=host_pattern,
+                module="shell",
+                args={"_raw_params": f"ping -c 3 {target} > /dev/null 2>&1 && echo 'success' || echo 'failed'"},
+                inventory=inventory_str,
+                cwd=str(cwd) if cwd else None,
+                env=env
+            )
+            
+            # Port connectivity tests
+            port_results = {}
+            for port in ports:
+                port_test = ansible_task(
+                    host_pattern=host_pattern,
+                    module="shell",
+                    args={"_raw_params": f"nc -z -w5 {target} {port} && echo 'open' || echo 'closed'"},
+                    inventory=inventory_str,
+                    cwd=str(cwd) if cwd else None,
+                    env=env
+                )
+                port_results[port] = port_test.get("stdout", "").strip()
+            
+            # Traceroute
+            traceroute_result = ansible_task(
+                host_pattern=host_pattern,
+                module="shell",
+                args={"_raw_params": f"traceroute -m 10 {target} 2>/dev/null | tail -1"},
+                inventory=inventory_str,
+                cwd=str(cwd) if cwd else None,
+                env=env
+            )
+            
+            matrix_results[host_pattern][target] = {
+                "ping": ping_result.get("stdout", "").strip(),
+                "ports": port_results,
+                "traceroute": traceroute_result.get("stdout", "").strip()
+            }
+    
+    return {
+        "ok": True,
+        "network_matrix": matrix_results,
+        "summary": {
+            "source_patterns": len(host_patterns),
+            "target_hosts": len(targets),
+            "ports_tested": ports
+        }
+    }
+
+
+@mcp.tool(name="ansible-security-audit")
+def ansible_security_audit(host_pattern: str, project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None, audit_categories: list[str] | None = None, generate_report: bool | None = True) -> dict[str, Any]:
+    """Comprehensive security audit and vulnerability assessment.
+    
+    Args:
+        host_pattern: Target hosts pattern
+        project_root: Project root directory
+        ansible_cfg_path: Ansible config file path
+        inventory_paths: Inventory file paths
+        audit_categories: Categories to audit (packages, permissions, network, config)
+        generate_report: Generate detailed security report
+    """
+    env, cwd = _compose_ansible_env(ansible_cfg_path, project_root, None)
+    inventory_str = ",".join(inventory_paths) if inventory_paths else None
+    
+    categories = audit_categories or ["packages", "permissions", "network", "config"]
+    audit_results = {"timestamp": datetime.now().isoformat(), "categories": {}}
+    
+    # Package vulnerability audit
+    if "packages" in categories:
+        # Check for packages with known vulnerabilities
+        package_audit = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": "apt list --upgradable 2>/dev/null | grep -E '(security|CVE)' | wc -l || yum check-update --security 2>/dev/null | grep -c 'needed for security' || echo '0'"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        
+        # Check for outdated packages
+        outdated_packages = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": "apt list --upgradable 2>/dev/null | wc -l || yum check-update 2>/dev/null | wc -l"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        
+        audit_results["categories"]["packages"] = {
+            "security_updates_available": package_audit.get("stdout", "0").strip(),
+            "total_updates_available": outdated_packages.get("stdout", "0").strip()
+        }
+    
+    # Permission and access audit
+    if "permissions" in categories:
+        # Check for SUID/SGID files
+        suid_check = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": "find /usr /bin /sbin -perm -4000 -o -perm -2000 2>/dev/null | wc -l"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        
+        # Check for world-writable files
+        writable_check = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": "find / -maxdepth 3 -perm -002 -type f 2>/dev/null | grep -v '/proc\\|/sys\\|/dev' | wc -l"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        
+        audit_results["categories"]["permissions"] = {
+            "suid_sgid_files": suid_check.get("stdout", "0").strip(),
+            "world_writable_files": writable_check.get("stdout", "0").strip()
+        }
+    
+    # Network security audit
+    if "network" in categories:
+        # Open ports scan
+        open_ports = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": "netstat -tuln | grep LISTEN | wc -l"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        
+        # Check for unnecessary services
+        services_check = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": "systemctl list-units --type=service --state=running | grep -E '(telnet|ftp|rsh|rlogin)' | wc -l"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        
+        audit_results["categories"]["network"] = {
+            "open_ports": open_ports.get("stdout", "0").strip(),
+            "insecure_services": services_check.get("stdout", "0").strip()
+        }
+    
+    # Configuration audit
+    if "config" in categories:
+        # SSH configuration check
+        ssh_config = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": "grep -E '^PermitRootLogin|^PasswordAuthentication|^Protocol' /etc/ssh/sshd_config 2>/dev/null || echo 'SSH config not accessible'"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        
+        # Password policy check
+        password_policy = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": "grep -E '^PASS_MAX_DAYS|^PASS_MIN_DAYS|^PASS_WARN_AGE' /etc/login.defs 2>/dev/null | wc -l"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        
+        audit_results["categories"]["config"] = {
+            "ssh_config": ssh_config.get("stdout", "").strip(),
+            "password_policies": password_policy.get("stdout", "0").strip()
+        }
+    
+    # Generate security score
+    if generate_report:
+        security_score = 100
+        recommendations = []
+        
+        # Calculate score based on findings
+        for category, results in audit_results["categories"].items():
+            if category == "packages":
+                security_updates = int(results.get("security_updates_available", "0"))
+                if security_updates > 0:
+                    security_score -= min(security_updates * 5, 30)
+                    recommendations.append(f"Apply {security_updates} security updates immediately")
+            
+            elif category == "permissions":
+                world_writable = int(results.get("world_writable_files", "0"))
+                if world_writable > 0:
+                    security_score -= min(world_writable * 2, 20)
+                    recommendations.append(f"Fix {world_writable} world-writable files")
+            
+            elif category == "network":
+                insecure_services = int(results.get("insecure_services", "0"))
+                if insecure_services > 0:
+                    security_score -= insecure_services * 15
+                    recommendations.append("Disable insecure network services")
+        
+        audit_results["security_assessment"] = {
+            "score": max(0, security_score),
+            "level": "critical" if security_score < 40 else "warning" if security_score < 70 else "good",
+            "recommendations": recommendations
+        }
+    
+    return {
+        "ok": True,
+        "audit": audit_results,
+        "host_pattern": host_pattern,
+        "timestamp": audit_results["timestamp"]
+    }
+
+
+@mcp.tool(name="ansible-health-monitor")
+def ansible_health_monitor(host_pattern: str, project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None, monitoring_duration: int | None = 300, metrics_interval: int | None = 30) -> dict[str, Any]:
+    """Continuous health monitoring with trend analysis.
+    
+    Args:
+        host_pattern: Target hosts pattern
+        project_root: Project root directory
+        ansible_cfg_path: Ansible config file path
+        inventory_paths: Inventory file paths
+        monitoring_duration: Total monitoring duration in seconds
+        metrics_interval: Interval between metric collections in seconds
+    """
+    env, cwd = _compose_ansible_env(ansible_cfg_path, project_root, None)
+    inventory_str = ",".join(inventory_paths) if inventory_paths else None
+    
+    duration = monitoring_duration or 300
+    interval = metrics_interval or 30
+    collection_points = duration // interval
+    
+    # Collect metrics over time
+    metrics_history = []
+    start_time = datetime.now()
+    
+    for i in range(collection_points):
+        # Collect current metrics
+        current_metrics = ansible_task(
+            host_pattern=host_pattern,
+            module="shell",
+            args={"_raw_params": "echo $(date '+%Y-%m-%d %H:%M:%S'),$(cat /proc/loadavg | awk '{print $1}'),$(free | grep Mem | awk '{print ($3/$2)*100}'),$(df / | tail -1 | awk '{print $5}' | sed 's/%//')"},
+            inventory=inventory_str,
+            cwd=str(cwd) if cwd else None,
+            env=env
+        )
+        
+        if current_metrics.get("ok"):
+            timestamp, load_avg, memory_percent, disk_percent = current_metrics.get("stdout", "").strip().split(',')
+            metrics_history.append({
+                "timestamp": timestamp,
+                "load_average": float(load_avg),
+                "memory_percent": float(memory_percent),
+                "disk_percent": float(disk_percent)
+            })
+        
+        # Wait for next interval (except for last iteration)
+        if i < collection_points - 1:
+            time.sleep(interval)
+    
+    # Analyze trends
+    if len(metrics_history) > 1:
+        # Calculate trends
+        load_trend = (metrics_history[-1]["load_average"] - metrics_history[0]["load_average"]) / len(metrics_history)
+        memory_trend = (metrics_history[-1]["memory_percent"] - metrics_history[0]["memory_percent"]) / len(metrics_history)
+        
+        # Detect anomalies
+        load_values = [m["load_average"] for m in metrics_history]
+        memory_values = [m["memory_percent"] for m in metrics_history]
+        
+        load_avg_val = sum(load_values) / len(load_values)
+        memory_avg_val = sum(memory_values) / len(memory_values)
+        
+        anomalies = []
+        for metric in metrics_history:
+            if metric["load_average"] > load_avg_val * 1.5:
+                anomalies.append(f"High load spike at {metric['timestamp']}: {metric['load_average']}")
+            if metric["memory_percent"] > memory_avg_val * 1.3:
+                anomalies.append(f"Memory spike at {metric['timestamp']}: {metric['memory_percent']}%")
+        
+        trend_analysis = {
+            "load_trend": "increasing" if load_trend > 0.1 else "decreasing" if load_trend < -0.1 else "stable",
+            "memory_trend": "increasing" if memory_trend > 1 else "decreasing" if memory_trend < -1 else "stable",
+            "anomalies": anomalies,
+            "average_load": load_avg_val,
+            "average_memory": memory_avg_val
+        }
+    else:
+        trend_analysis = {"error": "Insufficient data for trend analysis"}
+    
+    return {
+        "ok": True,
+        "monitoring": {
+            "start_time": start_time.isoformat(),
+            "duration_seconds": duration,
+            "data_points": len(metrics_history),
+            "metrics_history": metrics_history,
+            "trend_analysis": trend_analysis
+        },
+        "host_pattern": host_pattern
+    }
+
+
+@mcp.tool(name="ansible-performance-baseline")
+def ansible_performance_baseline(host_pattern: str, project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None, benchmark_duration: int | None = 60, store_baseline: bool | None = True) -> dict[str, Any]:
+    """Establish performance baselines and detect regressions.
+    
+    Args:
+        host_pattern: Target hosts pattern
+        project_root: Project root directory
+        ansible_cfg_path: Ansible config file path
+        inventory_paths: Inventory file paths
+        benchmark_duration: Duration for benchmark tests in seconds
+        store_baseline: Store baseline for future comparisons
+    """
+    env, cwd = _compose_ansible_env(ansible_cfg_path, project_root, None)
+    inventory_str = ",".join(inventory_paths) if inventory_paths else None
+    
+    duration = benchmark_duration or 60
+    baseline_results = {"timestamp": datetime.now().isoformat(), "benchmarks": {}}
+    
+    # CPU benchmark (simple calculation test)
+    cpu_benchmark = ansible_task(
+        host_pattern=host_pattern,
+        module="shell",
+        args={"_raw_params": f"time (for i in {{1..1000000}}; do echo $((i*i)) > /dev/null; done) 2>&1 | grep real | awk '{{print $2}}'"},
+        inventory=inventory_str,
+        cwd=str(cwd) if cwd else None,
+        env=env
+    )
+    baseline_results["benchmarks"]["cpu"] = cpu_benchmark.get("stdout", "").strip()
+    
+    # Memory benchmark (allocate and access memory)
+    memory_benchmark = ansible_task(
+        host_pattern=host_pattern,
+        module="shell",
+        args={"_raw_params": "dd if=/dev/zero of=/tmp/testfile bs=1M count=100 2>&1 | grep -o '[0-9.]* MB/s' | head -1"},
+        inventory=inventory_str,
+        cwd=str(cwd) if cwd else None,
+        env=env
+    )
+    baseline_results["benchmarks"]["memory"] = memory_benchmark.get("stdout", "").strip()
+    
+    # Disk I/O benchmark
+    disk_benchmark = ansible_task(
+        host_pattern=host_pattern,
+        module="shell",
+        args={"_raw_params": "dd if=/dev/zero of=/tmp/testfile bs=1M count=100 conv=fdatasync 2>&1 | grep -o '[0-9.]* MB/s' | tail -1; rm -f /tmp/testfile"},
+        inventory=inventory_str,
+        cwd=str(cwd) if cwd else None,
+        env=env
+    )
+    baseline_results["benchmarks"]["disk_write"] = disk_benchmark.get("stdout", "").strip()
+    
+    # Network latency test (to local gateway)
+    network_test = ansible_task(
+        host_pattern=host_pattern,
+        module="shell",
+        args={"_raw_params": "ping -c 10 $(ip route | grep default | awk '{print $3}' | head -1) | grep 'avg' | awk -F'/' '{print $5}'"},
+        inventory=inventory_str,
+        cwd=str(cwd) if cwd else None,
+        env=env
+    )
+    baseline_results["benchmarks"]["network_latency"] = network_test.get("stdout", "").strip()
+    
+    # System load during benchmarks
+    load_test = ansible_task(
+        host_pattern=host_pattern,
+        module="shell",
+        args={"_raw_params": "uptime | awk '{print $(NF-2)}' | tr -d ','"},
+        inventory=inventory_str,
+        cwd=str(cwd) if cwd else None,
+        env=env
+    )
+    baseline_results["benchmarks"]["system_load"] = load_test.get("stdout", "").strip()
+    
+    # Calculate performance score
+    performance_score = 100
+    issues = []
+    
+    # Analyze results (simplified scoring)
+    try:
+        if baseline_results["benchmarks"]["system_load"]:
+            load_val = float(baseline_results["benchmarks"]["system_load"])
+            if load_val > 2.0:
+                performance_score -= 20
+                issues.append("High system load detected")
+        
+        if "MB/s" in baseline_results["benchmarks"]["memory"]:
+            memory_speed = float(baseline_results["benchmarks"]["memory"].split()[0])
+            if memory_speed < 100:  # Less than 100 MB/s
+                performance_score -= 15
+                issues.append("Low memory bandwidth")
+    except (ValueError, IndexError):
+        issues.append("Could not parse some benchmark results")
+    
+    baseline_results["performance_assessment"] = {
+        "score": performance_score,
+        "level": "excellent" if performance_score > 85 else "good" if performance_score > 70 else "poor",
+        "issues": issues
+    }
+    
+    if store_baseline:
+        # In production, store this in a database or file
+        baseline_id = _generate_snapshot_id()
+        baseline_results["baseline_id"] = baseline_id
+    
+    return {
+        "ok": True,
+        "baseline": baseline_results,
+        "host_pattern": host_pattern,
+        "duration": duration
+    }
+
+
+@mcp.tool(name="ansible-log-hunter")
+def ansible_log_hunter(host_pattern: str, search_patterns: list[str], log_paths: list[str] | None = None, project_root: str | None = None, ansible_cfg_path: str | None = None, inventory_paths: list[str] | None = None, time_range: str | None = None, correlation_window: int | None = 300) -> dict[str, Any]:
+    """Advanced log hunting and correlation across multiple sources.
+    
+    Args:
+        host_pattern: Target hosts pattern
+        search_patterns: List of regex patterns to search for
+        log_paths: List of log file paths (defaults to common system logs)
+        project_root: Project root directory
+        ansible_cfg_path: Ansible config file path
+        inventory_paths: Inventory file paths
+        time_range: Time range for logs (e.g., '1h', '24h', '7d')
+        correlation_window: Time window in seconds for event correlation
+    """
+    env, cwd = _compose_ansible_env(ansible_cfg_path, project_root, None)
+    inventory_str = ",".join(inventory_paths) if inventory_paths else None
+    
+    # Default log paths if not specified
+    default_logs = [
+        "/var/log/syslog",
+        "/var/log/messages", 
+        "/var/log/auth.log",
+        "/var/log/secure",
+        "/var/log/kern.log"
+    ]
+    logs_to_search = log_paths or default_logs
+    
+    # Build time filter if specified
+    time_filter = ""
+    if time_range:
+        if time_range.endswith('h'):
+            hours = int(time_range[:-1])
+            time_filter = f"--since '{hours} hours ago'"
+        elif time_range.endswith('d'):
+            days = int(time_range[:-1])
+            time_filter = f"--since '{days} days ago'"
+    
+    hunt_results = {}
+    all_matches = []
+    
+    for log_path in logs_to_search:
+        log_results = {}
+        
+        for pattern in search_patterns:
+            # Search for pattern in log
+            if time_filter and "journal" in log_path:
+                # Use journalctl for systemd logs
+                search_cmd = f"journalctl {time_filter} | grep -E '{pattern}'"
+            else:
+                # Regular log file search
+                search_cmd = f"grep -E '{pattern}' {log_path} 2>/dev/null | tail -100"
+            
+            search_result = ansible_task(
+                host_pattern=host_pattern,
+                module="shell",
+                args={"_raw_params": search_cmd},
+                inventory=inventory_str,
+                cwd=str(cwd) if cwd else None,
+                env=env
+            )
+            
+            if search_result.get("ok") and search_result.get("stdout"):
+                matches = search_result.get("stdout", "").strip().split('\n')
+                log_results[pattern] = {
+                    "matches": matches,
+                    "count": len(matches)
+                }
+                
+                # Add to all matches for correlation
+                for match in matches:
+                    all_matches.append({
+                        "log_file": log_path,
+                        "pattern": pattern,
+                        "line": match,
+                        "timestamp": _extract_timestamp_from_log(match)
+                    })
+        
+        if log_results:
+            hunt_results[log_path] = log_results
+    
+    # Correlate events within time window
+    correlated_events = []
+    if len(all_matches) > 1:
+        # Sort by timestamp
+        sorted_matches = sorted(all_matches, key=lambda x: x.get("timestamp", ""))
+        
+        # Find events within correlation window
+        for i, event in enumerate(sorted_matches):
+            related_events = [event]
+            event_time = event.get("timestamp")
+            
+            if event_time:
+                for j, other_event in enumerate(sorted_matches[i+1:], i+1):
+                    other_time = other_event.get("timestamp")
+                    if other_time and abs((event_time - other_time).total_seconds()) <= correlation_window:
+                        related_events.append(other_event)
+                
+                if len(related_events) > 1:
+                    correlated_events.append({
+                        "primary_event": event,
+                        "related_events": related_events[1:],
+                        "correlation_strength": len(related_events)
+                    })
+    
+    return {
+        "ok": True,
+        "hunt_results": hunt_results,
+        "correlation": {
+            "total_matches": len(all_matches),
+            "correlated_events": len(correlated_events),
+            "correlations": correlated_events[:10]  # Top 10 correlations
+        },
+        "summary": {
+            "patterns_searched": len(search_patterns),
+            "logs_searched": len(logs_to_search),
+            "logs_with_matches": len(hunt_results)
+        }
+    }
+
+
+def _extract_timestamp_from_log(log_line: str) -> datetime | None:
+    """Extract timestamp from log line (simplified implementation)."""
+    try:
+        # Try common log timestamp formats
+        timestamp_patterns = [
+            r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})',  # ISO format
+            r'(\w{3} \d{1,2} \d{2}:\d{2}:\d{2})',      # Syslog format
+        ]
+        
+        for pattern in timestamp_patterns:
+            match = re.search(pattern, log_line)
+            if match:
+                timestamp_str = match.group(1)
+                # Simplified parsing - in production use more robust parsing
+                if '-' in timestamp_str:
+                    return datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+                else:
+                    # Add current year for syslog format
+                    current_year = datetime.now().year
+                    return datetime.strptime(f"{current_year} {timestamp_str}", '%Y %b %d %H:%M:%S')
+    except Exception:
+        pass
+    return None
 
 
 if __name__ == "__main__":

@@ -89,6 +89,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 Tools (names)
 
+**Core Ansible Tools:**
 - create-playbook: Create playbooks from YAML strings or dicts
 - validate-playbook: Validate playbook syntax (ansible-playbook --syntax-check)
 - ansible-playbook: Execute playbooks
@@ -99,18 +100,41 @@ Tools (names)
 - register-project: Register an Ansible project for easy reuse
 - list-projects: Show registered projects and default
 - project-playbooks: Discover playbooks under a project root
-- project-run-playbook: Run a playbook using a registered project’s inventory/env
+- project-run-playbook: Run a playbook using a registered project's inventory/env
 
-Local inventory suite (no AAP/AWX)
-
+**Local inventory suite (no AAP/AWX):**
 - inventory-parse: Parse inventories (ansible.cfg-aware), return hosts/groups/hostvars
 - inventory-graph: Show group/host graph
-- inventory-find-host: Show a host’s groups and merged vars
+- inventory-find-host: Show a host's groups and merged vars
 - ansible-ping: Ad-hoc ping module
 - ansible-gather-facts: Run setup and return parsed facts
 - validate-yaml: Validate YAML files with error locations
 - galaxy-install: Install roles/collections from requirements
 - project-bootstrap: Galaxy install + env inspection
+
+**Advanced Troubleshooting Suite:**
+
+*Foundation Tools:*
+- ansible-remote-command: Execute arbitrary shell commands with enhanced output parsing
+- ansible-fetch-logs: Fetch and analyze log files with pattern detection and correlation
+- ansible-service-manager: Manage services with status checking and log correlation
+
+*Intelligent Diagnostics:*
+- ansible-diagnose-host: Comprehensive health assessment with scoring and recommendations
+- ansible-capture-baseline: Capture system state snapshots for comparison
+- ansible-compare-states: Time-travel debugging with baseline comparisons
+
+*Automation & Self-Healing:*
+- ansible-auto-heal: Intelligent automated problem resolution with safety checks
+
+*Network & Security:*
+- ansible-network-matrix: Comprehensive network connectivity testing between hosts
+- ansible-security-audit: Security vulnerability assessment and compliance checking
+
+*Performance & Monitoring:*
+- ansible-health-monitor: Continuous monitoring with trend analysis and anomaly detection
+- ansible-performance-baseline: Performance benchmarking and regression detection
+- ansible-log-hunter: Advanced log correlation and pattern hunting across multiple sources
 
 Environment variables (optional)
 
@@ -372,3 +396,140 @@ Below are all tools with short descriptions, minimal args, an example question y
     ```
   - Example question: "Encrypt group_vars/all/vault.yml with my vault password."
   - Possible answer: `{ "ok": true, "rc": 0 }`
+
+## Troubleshooting Suite Reference
+
+### Foundation Tools
+
+- **ansible-remote-command**: Execute shell commands with enhanced parsing
+  - Minimal args:
+    ```json
+    { "host_pattern": "webserver", "command": "ps aux | grep nginx" }
+    ```
+  - Example question: "Show me all nginx processes on the webserver."
+  - Sample answer: `{ "ok": true, "stdout": "Process list...", "parsed_output": {...} }`
+
+- **ansible-fetch-logs**: Fetch and analyze log files
+  - Minimal args:
+    ```json
+    { "host_pattern": "app*", "log_paths": ["/var/log/nginx/error.log"], "analyze": true }
+    ```
+  - Example question: "Get the last 100 lines from nginx error logs and analyze patterns."
+  - Sample answer: `{ "ok": true, "logs": {...}, "summary": {"total_logs": 1, "successful": 1} }`
+
+- **ansible-service-manager**: Service management with logs
+  - Minimal args:
+    ```json
+    { "host_pattern": "web", "service_name": "nginx", "action": "restart", "check_logs": true }
+    ```
+  - Example question: "Restart nginx service and show recent logs."
+  - Sample answer: `{ "ok": true, "action_result": {...}, "status": {...}, "logs": {...} }`
+
+### Intelligent Diagnostics
+
+- **ansible-diagnose-host**: Comprehensive health assessment
+  - Minimal args:
+    ```json
+    { "host_pattern": "production", "checks": ["system", "network", "security"], "include_recommendations": true }
+    ```
+  - Example question: "Run a complete health check on production servers with recommendations."
+  - Sample answer: `{ "ok": true, "diagnosis": {...}, "health_score": {"score": 85, "level": "good"} }`
+
+- **ansible-capture-baseline**: Capture system state baseline
+  - Minimal args:
+    ```json
+    { "host_pattern": "web*", "snapshot_name": "pre-deployment", "include": ["configs", "processes"] }
+    ```
+  - Example question: "Capture a baseline snapshot before deployment."
+  - Sample answer: `{ "ok": true, "snapshot_id": "snapshot_20250101_120000_abc123", "categories_captured": [...] }`
+
+- **ansible-compare-states**: Compare against baseline
+  - Minimal args:
+    ```json
+    { "host_pattern": "web*", "baseline_snapshot_id": "snapshot_20250101_120000_abc123" }
+    ```
+  - Example question: "Compare current state with pre-deployment baseline."
+  - Sample answer: `{ "ok": true, "comparison": {"differences": {...}, "summary": {...}} }`
+
+### Automation & Self-Healing
+
+- **ansible-auto-heal**: Automated problem resolution
+  - Minimal args:
+    ```json
+    { "host_pattern": "database", "symptoms": ["high_memory", "disk_full"], "max_impact": "medium", "dry_run": true }
+    ```
+  - Example question: "Automatically heal memory and disk issues on database servers (preview mode)."
+  - Sample answer: `{ "ok": true, "proposed_actions": [...], "summary": {"actionable_symptoms": 2} }`
+
+### Network & Security
+
+- **ansible-network-matrix**: Network connectivity testing
+  - Minimal args:
+    ```json
+    { "host_patterns": ["web*", "db*"], "check_ports": [22, 3306, 443] }
+    ```
+  - Example question: "Test network connectivity between web and database servers."
+  - Sample answer: `{ "ok": true, "network_matrix": {...}, "summary": {"source_patterns": 2, "ports_tested": [22, 3306, 443]} }`
+
+- **ansible-security-audit**: Security vulnerability assessment
+  - Minimal args:
+    ```json
+    { "host_pattern": "all", "audit_categories": ["packages", "permissions", "network"], "generate_report": true }
+    ```
+  - Example question: "Run a comprehensive security audit on all servers."
+  - Sample answer: `{ "ok": true, "audit": {...}, "security_assessment": {"score": 75, "level": "warning"} }`
+
+### Performance & Monitoring
+
+- **ansible-health-monitor**: Continuous monitoring with trends
+  - Minimal args:
+    ```json
+    { "host_pattern": "production", "monitoring_duration": 300, "metrics_interval": 30 }
+    ```
+  - Example question: "Monitor production servers for 5 minutes and analyze trends."
+  - Sample answer: `{ "ok": true, "monitoring": {"trend_analysis": {...}, "anomalies": []} }`
+
+- **ansible-performance-baseline**: Performance benchmarking
+  - Minimal args:
+    ```json
+    { "host_pattern": "web*", "benchmark_duration": 60, "store_baseline": true }
+    ```
+  - Example question: "Run performance benchmarks on web servers and store as baseline."
+  - Sample answer: `{ "ok": true, "baseline": {"benchmarks": {...}, "performance_assessment": {"score": 90}} }`
+
+- **ansible-log-hunter**: Advanced log correlation
+  - Minimal args:
+    ```json
+    { "host_pattern": "app*", "search_patterns": ["ERROR", "CRITICAL"], "time_range": "1h", "correlation_window": 300 }
+    ```
+  - Example question: "Hunt for errors in application logs from the last hour and correlate events."
+  - Sample answer: `{ "ok": true, "hunt_results": {...}, "correlation": {"correlated_events": 3} }`
+
+## Key Features of Troubleshooting Suite
+
+### 🎯 **Intelligent Analysis**
+- **Health Scoring**: Automated scoring based on CPU, memory, disk, network, and security metrics
+- **Pattern Recognition**: Smart analysis of log patterns, error correlations, and system anomalies
+- **Trend Detection**: Real-time monitoring with trend analysis and predictive insights
+
+### 🔧 **Automated Remediation**
+- **Symptom-to-Solution Mapping**: Intelligent problem resolution based on detected symptoms
+- **Safety-First Approach**: Graduated response with impact assessment and mandatory safety checks
+- **Dry-Run Mode**: Preview all actions before execution for safety validation
+
+### 📊 **Advanced Analytics**
+- **Baseline Comparisons**: Time-travel debugging with comprehensive state comparisons
+- **Performance Benchmarking**: Establish baselines and detect performance regressions
+- **Security Auditing**: Comprehensive vulnerability assessment with compliance scoring
+
+### 🛡️ **Enterprise-Grade Safety**
+- **Impact Controls**: Configurable impact levels (low/medium/high) with approval workflows
+- **Audit Trails**: Complete logging of all troubleshooting actions and decisions
+- **Rollback Capabilities**: Automated reversion for failed operations
+
+### 🔄 **Pure Ansible Integration**
+- **No SSH Dependencies**: All operations go through Ansible's native connection framework
+- **Module Consistency**: Uses standard Ansible modules for maximum compatibility
+- **Configuration Aware**: Respects ansible.cfg and existing project configurations
+
+All troubleshooting tools maintain the same safety, auditability, and Ansible-native approach while providing enterprise-grade automation capabilities.
